@@ -124,7 +124,7 @@ async function sbFetch(path, method, body) {
   } catch(e) { console.warn('SB:', e.message); return null; }
 }
 
-function jp(v,d) { try { return JSON.parse(v)||d; } catch { return d; } }
+function jp(v,d) { if(Array.isArray(v)) return v; try { return JSON.parse(v)||d; } catch { return d; } }
 function today() { return new Date().toISOString().slice(0,10); }
 function ym() { return new Date().toISOString().slice(0,7); }
 
@@ -158,7 +158,8 @@ function mapRec(r) {
     cats: jp(r.cats,[]), techs: jp(r.techs,[]), tc: jp(r.tech_checks||r.tc,{}),
     checks: { '精密検査':!!r.chk_seimitsu,'最終検査':!!r.chk_saishuu,'チェック鈴木':!!r.chk_suzuki,'検査送信':!!r.chk_kensashin,'orthocom':!!r.chk_orthocom,'backup':!!r.chk_backup },
     chk_ready: !!r.chk_ready,
-    chk_was_mik: !!r.chk_was_mik
+    chk_was_mik: !!r.chk_was_mik,
+    hidden: !!r.hidden
   };
 }
 
@@ -222,7 +223,13 @@ function EditBtn({r, db, setDb, saveLocal}){
 }
 
 function DelBtn({id,db,setDb,saveLocal}){
-  const del=()=>{ if(!confirm('削除しますか？'))return; const n=db.filter(r=>r.id!==id); setDb(n);saveLocal(n); sbFetch('records?id=eq.'+id,'DELETE'); };
+  const r=db.find(x=>x.id===id);
+  const del=()=>{
+    if(!confirm((r?r.patient_name+'のデータを':'このデータを')+'記録管理から削除しますか？\n\n確認タブには残ります。'))return;
+    const n=db.map(x=>x.id===id?{...x,hidden:true}:x);
+    setDb(n);saveLocal(n);
+    sbFetch('records?id=eq.'+id,'PATCH',{hidden:true}).catch(()=>{});
+  };
   return <button className="btn btn-d" onClick={del}>削除</button>;
 }
 
@@ -230,22 +237,64 @@ function DelBtn({id,db,setDb,saveLocal}){
 function App(){
   const [db,setDb]=useState([]);
   const [patients,setPatients]=useState({});
-  const [tab,setTab]=useState('mik');
+  const [tab,setTab]=useState('inp');
+  const [showMikAlert,setShowMikAlert]=useState(false);
+  const switchTab=(t)=>{
+    if(t==='inp'){
+      const mikCount=db.filter(r=>r.chk_mikiroku&&!r.hidden).length;
+      if(mikCount>0) setShowMikAlert(true);
+    }
+    setTab(t);
+  };
   const [syncing,setSyncing]=useState(false);
   const [loading,setLoading]=useState(true);
   const [inputInit,setInputInit]=useState(null);
   const [fromMik,setFromMik]=useState(false);
+  const [showReport,setShowReport]=useState(false);
+  const [notice,setNotice]=useState('');
+  const [showNoticeEdit,setShowNoticeEdit]=useState(false);
+  const [noticePw,setNoticePw]=useState('');
+  const [noticeInput,setNoticeInput]=useState('');
+  const [noticeEditMode,setNoticeEditMode]=useState(false);
+  const NOTICE_PW='daimon1020';
+
+  useEffect(()=>{
+    const saved=localStorage.getItem('itero_notice');
+    if(saved) setNotice(saved);
+    sbFetch('app_settings?key=eq.notice&limit=1').then(r=>{
+      if(r&&r.length) setNotice(r[0].value||'');
+    }).catch(()=>{});
+  },[]);
+
+  const saveNotice=async()=>{
+    localStorage.setItem('itero_notice',noticeInput);
+    setNotice(noticeInput);
+    await sbFetch('app_settings?key=eq.notice','PATCH',{value:noticeInput}).catch(()=>{});
+    setNoticeEditMode(false);setShowNoticeEdit(false);setNoticePw('');
+  };
 
   const saveLocal=(d)=>{ try{localStorage.setItem('itero_db',JSON.stringify(d));}catch(e){} };
 
   const loadData=useCallback(async()=>{
     try{ const lp=localStorage.getItem('itero_pts'); if(lp)setPatients(JSON.parse(lp)); const ld=localStorage.getItem('itero_db'); if(ld){setDb(JSON.parse(ld).map(mapRec));setLoading(false);} }catch(e){}
     try{
+      console.log('Loading from Supabase...');
       let all=[],off=0;
       while(true){ const r=await sbFetch('patients?limit=1000&offset='+off); if(!r||!r.length)break; all=all.concat(r); if(r.length<1000)break; off+=1000; }
       if(all.length){ const pm={}; all.forEach(p=>pm[p.patient_id]=p.patient_name); setPatients(pm); localStorage.setItem('itero_pts',JSON.stringify(pm)); }
-      const recs=await sbFetch('records?order=created_at.desc&limit=500');
-      if(recs){ const m=recs.map(mapRec).sort((a,b)=>{ if(!a.date&&!b.date)return 0; if(!a.date)return 1; if(!b.date)return -1; return b.date.localeCompare(a.date); }); setDb(m); localStorage.setItem('itero_db',JSON.stringify(recs)); }
+      // 全件取得（ページネーション）
+      let recs=[], recOff=0;
+      while(true){
+        const batch=await sbFetch('records?order=id.desc&limit=1000&offset='+recOff);
+        if(!batch||!batch.length) break;
+        recs=recs.concat(batch);
+        if(batch.length<1000) break;
+        recOff+=1000;
+      }
+      const recsResult=recs;
+      console.log('Records fetched:', recsResult.length);
+      if(recsResult.length>0){ const m=recsResult.map(mapRec).sort((a,b)=>{ if(!a.date&&!b.date)return 0; if(!a.date)return 1; if(!b.date)return -1; return b.date.localeCompare(a.date); }); setDb(m); localStorage.setItem('itero_db',JSON.stringify(recsResult)); }
+      else { console.warn('Supabase returned 0 records - keeping local data'); }
     }catch(e){}
     setLoading(false);
   },[]);
@@ -255,16 +304,57 @@ function App(){
   const updRec=(id,ch)=>setDb(prev=>{ const n=prev.map(r=>r.id===id?{...r,...ch}:r); saveLocal(n); return n; });
   const syncAll=async()=>{ setSyncing(true); await loadData(); setSyncing(false); };
 
-  const TABS=[{id:'mik',label:'⚠️ 未記入',cls:'ta'},{id:'inp',label:'新規入力'},{id:'iteroweek',label:'📅 今週iTero'},{id:'today',label:'📅 今週技工'},{id:'rec',label:'記録管理'},{id:'done',label:'✅ 完了'},{id:'dc',label:'確認'},{id:'dash',label:'集計'}];
+  const TABS=[{id:'inp',label:'新規入力'},{id:'mik',label:'⚠️ 未記入',cls:'ta'},{id:'iteroweek',label:'📅 今週iTero'},{id:'today',label:'📅 今週技工'},{id:'rec',label:'記録管理'},{id:'done',label:'✅ 完了'},{id:'dc',label:'確認'},{id:'dash',label:'集計'}];
 
   return <>
     <div id="root">
       {loading&&<div style={{position:'fixed',inset:0,background:'rgba(245,244,240,.92)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:999,fontSize:14,color:'var(--t2)'}}>読み込み中...</div>}
-      <div className="topbar"><h1>🦷 iTero管理</h1><button className="sync-btn" onClick={syncAll}>{syncing?'同期中...':'同期'}</button></div>
-      <div className="main-tabs">{TABS.map(t=><button key={t.id} className={(t.cls||'')+(tab===t.id?' on':'')} onClick={()=>setTab(t.id)}>{t.label}</button>)}</div>
+      <div className="topbar"><h1>🦷 iTero管理</h1><button onClick={()=>setShowReport(true)} style={{marginLeft:'auto',fontSize:12,padding:'5px 10px',borderRadius:'var(--rs)',border:'1px solid var(--b2)',background:'transparent',color:'var(--t2)',cursor:'pointer'}}>🐛 報告</button><button className="sync-btn" style={{marginLeft:6}} onClick={syncAll}>{syncing?'同期中...':'同期'}</button></div>
+      {notice&&!noticeEditMode&&<div style={{background:'#fffbeb',borderBottom:'1px solid #fde68a',padding:'6px 14px',display:'flex',alignItems:'center',gap:8,flexShrink:0}}>
+        <span style={{fontSize:11,fontWeight:700,color:'var(--amt)'}}>📢</span>
+        <span style={{fontSize:12,color:'var(--amt)',flex:1}}>{notice}</span>
+        <button onClick={()=>{setNoticeInput(notice);setShowNoticeEdit(v=>!v);}} style={{fontSize:10,padding:'2px 8px',border:'1px solid #fde68a',borderRadius:10,background:'transparent',color:'var(--amt)',cursor:'pointer'}}>編集</button>
+      </div>}
+      {!notice&&<div style={{background:'var(--s2)',borderBottom:'1px solid var(--border)',padding:'4px 14px',flexShrink:0}}>
+        <button onClick={()=>{setNoticeInput('');setShowNoticeEdit(v=>!v);}} style={{fontSize:11,padding:'2px 8px',border:'1px solid var(--b2)',borderRadius:10,background:'transparent',color:'var(--t3)',cursor:'pointer'}}>📢 連絡事項を追加</button>
+      </div>}
+      {showNoticeEdit&&<div style={{background:'var(--surface)',borderBottom:'1px solid var(--border)',padding:'8px 14px',flexShrink:0}}>
+        {!noticeEditMode
+          ?<div style={{display:'flex',gap:6,alignItems:'center'}}>
+            <input type="password" value={noticePw} onChange={e=>setNoticePw(e.target.value)} onKeyDown={e=>e.key==='Enter'&&noticePw===NOTICE_PW&&(setNoticeEditMode(true))} placeholder="管理者PW" style={{fontSize:13,padding:'5px 8px',border:'1px solid var(--b2)',borderRadius:'var(--rs)',outline:'none',width:130}}/>
+            <button className="btn btn-p" style={{fontSize:12,padding:'5px 12px'}} onClick={()=>{if(noticePw===NOTICE_PW)setNoticeEditMode(true);else alert('パスワードが違います');}}>確認</button>
+            <button className="btn" style={{fontSize:12,padding:'5px 10px'}} onClick={()=>{setShowNoticeEdit(false);setNoticePw('');}}>キャンセル</button>
+          </div>
+          :<div style={{display:'flex',gap:6,alignItems:'center'}}>
+            <input value={noticeInput} onChange={e=>setNoticeInput(e.target.value)} placeholder="連絡事項を入力..." style={{flex:1,fontSize:13,padding:'5px 8px',border:'1px solid var(--b2)',borderRadius:'var(--rs)',outline:'none',background:'var(--s2)'}}/>
+            <button className="btn btn-p" style={{fontSize:12,padding:'5px 12px'}} onClick={saveNotice}>保存</button>
+            <button className="btn btn-d" style={{fontSize:12,padding:'5px 10px'}} onClick={()=>{setNoticeInput('');saveNotice();}}>削除</button>
+          </div>
+        }
+      </div>}
+      <div className="main-tabs">{TABS.map(t=><button key={t.id} className={(t.cls||'')+(tab===t.id?' on':'')} onClick={()=>switchTab(t.id)}>{t.label}</button>)}</div>
+      {showReport&&<ReportModal onClose={()=>setShowReport(false)}/>}
+      {showMikAlert&&<div style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.5)',zIndex:999,display:'flex',alignItems:'center',justifyContent:'center',padding:20}}>
+        <div style={{background:'var(--surface)',borderRadius:'var(--r)',padding:24,maxWidth:360,width:'100%',textAlign:'center',boxShadow:'0 4px 24px rgba(0,0,0,0.2)'}}>
+          <div style={{fontSize:32,marginBottom:12}}>⚠️</div>
+          <div style={{fontSize:16,fontWeight:700,color:'var(--rt)',marginBottom:12}}>未記入が{db.filter(r=>r.chk_mikiroku&&!r.hidden).length}件あります</div>
+          <div style={{textAlign:'left',maxHeight:200,overflowY:'auto',marginBottom:16,background:'var(--s2)',borderRadius:'var(--rs)',padding:'8px 12px'}}>
+            {db.filter(r=>r.chk_mikiroku&&!r.hidden).map(r=>
+              <div key={r.id} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'6px 0',borderBottom:'1px solid var(--border)',fontSize:13}}>
+                <span style={{fontWeight:600}}>{r.patient_name}</span>
+                <StaffBadge staff={r.staff}/>
+              </div>
+            )}
+          </div>
+          <div style={{display:'flex',gap:10}}>
+            <button className="btn btn-p" style={{flex:1,fontSize:13}} onClick={()=>{setShowMikAlert(false);setTab('mik');}}>未記入を確認</button>
+            <button className="btn" style={{flex:1,fontSize:13}} onClick={()=>setShowMikAlert(false)}>このまま入力</button>
+          </div>
+        </div>
+      </div>}
       <div className="content">
         {tab==='mik'  && <MikTab db={db} setDb={setDb} patients={patients} setPatients={setPatients} saveLocal={saveLocal} setTab={setTab} setInputInit={setInputInit} setFromMik={setFromMik}/>}
-        {tab==='iteroweek'&&<IteroWeekTab db={db} updRec={updRec}/>}
+        {tab==='iteroweek'&&<IteroWeekTab db={db} updRec={updRec} setDb={setDb} saveLocal={saveLocal}/>}
         {tab==='today'&& <TodayTab db={db} updRec={updRec}/>}
         {tab==='inp'  && <InpTab db={db} setDb={setDb} patients={patients} setPatients={setPatients} saveLocal={saveLocal} initData={inputInit} fromMik={fromMik} setFromMik={setFromMik}/>}
         {tab==='rec'  && <RecTab db={db} updRec={updRec} setDb={setDb} saveLocal={saveLocal}/>}
@@ -293,27 +383,25 @@ function MikTab({db,setDb,patients,setPatients,saveLocal,setTab,setInputInit,set
 
   const save=async()=>{
     if(!pid||!name){setMsg({err:'IDと名前は必須です'});return;}
-    if(!sei&&!sai&&cats.length===0){setMsg({err:'検査（精密・最終）またはデータの種類を最低1つ選択してください'});return;}
-    if(techs.length>0&&!cats.includes('技工物')){setMsg({err:'技工物内容を選択した場合は種別「技工物」もチェックしてください'});return;}
+
     setMsg({info:'保存中...'});
-    const body={date:today(),patient_id:pid,patient_name:name,staff,cats:'[]',techs:'[]',old_flag:false,note:'未記入',setdate:null,chk_seimitsu:false,chk_saishuu:false,chk_isogu:false,chk_mikiroku:true,chk_suzuki:false,chk_mokei:false,chk_tochaku:false,chk_kensashin:false,chk_orthocom:false,chk_backup:false,chk_datachecked:false};
+    const body={date:scanDate,patient_id:pid,patient_name:name,staff,cats:'[]',techs:'[]',old_flag:false,note:'未記入',setdate:null,chk_seimitsu:false,chk_saishuu:false,chk_isogu:false,chk_mikiroku:true,chk_suzuki:false,chk_mokei:false,chk_tochaku:false,chk_kensashin:false,chk_orthocom:false,chk_backup:false,chk_datachecked:false};
     const r=await sbFetch('records','POST',body);
-    const nr=mapRec(r?r[0]:{...body,id:Date.now(),tc:{},cats:[],techs:[]});
+    if(!r||!r.length){ setMsg({err:'保存に失敗しました。通信状況を確認して、もう一度お試しください。'}); return; }
+    const nr=mapRec(r[0]);
     if(!patients[pid]){await sbFetch('patients','POST',{patient_id:pid,patient_name:name});setPatients(p=>({...p,[pid]:name}));}
     const n=[nr,...db].sort(function(a,b){ if(!a.date&&!b.date)return 0; if(!a.date)return 1; if(!b.date)return -1; return b.date.localeCompare(a.date); }); setDb(n);saveLocal(n);
-    setMsg({ok:'登録しました！'});setPid('');setName('');setStaff('');setAtag('');
+    setMsg({ok:'登録しました！'});setPid('');setName('');setStaff('');setAtag('');setScanDate(today());
     setTimeout(()=>setMsg(null),3000);
   };
 
   const goDetail=(r)=>{
-    setInputInit({pid:r.patient_id,name:r.patient_name,date:r.date,staff:r.staff||'',wasMikiroku:true});
+    setInputInit({pid:r.patient_id,name:r.patient_name,date:r.date,staff:r.staff||'',wasMikiroku:true,mikId:r.id});
     setFromMik(true);
-    const n=db.filter(x=>x.id!==r.id); setDb(n);saveLocal(n);
-    sbFetch('records?id=eq.'+r.id,'DELETE');
-    setTab('inp');
+    switchTab('inp');
   };
 
-  const list=db.filter(r=>r.chk_mikiroku);
+  const list=db.filter(r=>r.chk_mikiroku&&!r.hidden);
   return <div>
     <div className="card" style={{borderColor:'#fca5a5',background:'#fff5f5'}}>
       <div className="ct" style={{color:'var(--rt)'}}>⚠️ 記録未記入 — 簡易登録</div>
@@ -322,11 +410,17 @@ function MikTab({db,setDb,patients,setPatients,saveLocal,setTab,setInputInit,set
         <div className="f" style={{width:130,marginBottom:0}}><label>患者ID</label><input value={pid} onChange={e=>{setPid(e.target.value);lookup(e.target.value);}} placeholder="21245"/></div>
         <div className="f" style={{flex:1,marginBottom:0}}><label>患者名 <span className="atag">{atag}</span></label><input value={name} onChange={e=>setName(e.target.value)} placeholder="IDで自動入力"/></div>
       </div>
-      <div className="f" style={{marginBottom:10}}>
-        <label>担当</label>
-        <select value={staff} onChange={e=>setStaff(e.target.value)}>
-          <option value="">選択</option>{STAFF.map(s=><option key={s}>{s}</option>)}
-        </select>
+      <div className="row2" style={{marginBottom:10}}>
+        <div className="f" style={{marginBottom:0}}>
+          <label>データ取得日</label>
+          <input type="date" value={scanDate} onChange={e=>setScanDate(e.target.value)}/>
+        </div>
+        <div className="f" style={{marginBottom:0}}>
+          <label>担当</label>
+          <select value={staff} onChange={e=>setStaff(e.target.value)}>
+            <option value="">選択</option>{STAFF.map(s=><option key={s}>{s}</option>)}
+          </select>
+        </div>
       </div>
       {msg&&<div className={"al "+(msg.ok?'al-ok':msg.err?'al-err':'')} style={msg.info?{background:'var(--s2)',color:'var(--t2)'}:{}}>{msg.ok||msg.err||msg.info}</div>}
       <button className="btn" style={{width:'100%',background:'var(--red)',color:'#fff',borderColor:'var(--red)'}} onClick={save}>未記入として登録</button>
@@ -383,16 +477,32 @@ function InpTab({db,setDb,patients,setPatients,saveLocal,initData,fromMik,setFro
   };
 
   const tog=(arr,set,v)=>set(a=>a.includes(v)?a.filter(x=>x!==v):[...a,v]);
+  // 技工物内容チップのトグル（自動で種別「技工物」も追加）
+  const togTech=(v)=>{
+    setTechs(a=>{
+      const next=a.includes(v)?a.filter(x=>x!==v):[...a,v];
+      // 技工物内容が1つでもあれば種別「技工物」を自動追加
+      if(next.length>0) setCats(c=>c.includes('技工物')?c:[...c,'技工物']);
+      else setCats(c=>c.filter(x=>x!=='技工物'));
+      return next;
+    });
+  };
 
   const save=async()=>{
     if(!pid||!name){setMsg({err:'IDと名前は必須です'});return;}
+    if(cats.length===0&&!sei&&!sai){setMsg({err:'種別または検査を1つ以上選択してください'});return;}
+    if(cats.includes('技工物')&&techs.length===0){setMsg({err:'技工物を選択した場合は技工物内容を1つ以上選択してください'});return;}
     setMsg({info:'保存中...'});
     const wasMik=initData&&initData.wasMikiroku;
     const body={date,patient_id:pid,patient_name:name,staff,cats:JSON.stringify(cats),techs:JSON.stringify(techs),old_flag:old,note,setdate:null,chk_seimitsu:sei,chk_saishuu:sai,chk_isogu:iso,chk_mikiroku:false,chk_datachecked:false,chk_suzuki:false,chk_mokei:false,chk_tochaku:false,chk_kensashin:false,chk_orthocom:false,chk_backup:false,chk_was_mik:!!wasMik};
     const r=await sbFetch('records','POST',body);
-    const nr=mapRec(r?r[0]:{...body,id:Date.now(),tc:{},cats,techs});
+    if(!r||!r.length){ setMsg({err:'保存に失敗しました。通信状況を確認して、もう一度お試しください。（未記入データは削除されていません）'}); return; }
+    const nr=mapRec(r[0]);
     if(!patients[pid]){await sbFetch('patients','POST',{patient_id:pid,patient_name:name});setPatients(p=>({...p,[pid]:name}));}
-    const n=[nr,...db].sort(function(a,b){ if(!a.date&&!b.date)return 0; if(!a.date)return 1; if(!b.date)return -1; return b.date.localeCompare(a.date); }); setDb(n);saveLocal(n);
+    let baseDb=db;
+    const mikId=initData&&initData.mikId;
+    if(mikId){ baseDb=db.filter(x=>x.id!==mikId); sbFetch('records?id=eq.'+mikId,'DELETE').catch(()=>{}); }
+    const n=[nr,...baseDb].sort(function(a,b){ if(!a.date&&!b.date)return 0; if(!a.date)return 1; if(!b.date)return -1; return b.date.localeCompare(a.date); }); setDb(n);saveLocal(n);
     setMsg({ok:'登録しました！'});
     setPid('');setName('');setDate(today());setStaff('');setCats([]);setTechs([]);setSei(false);setSai(false);setOld(false);setIso(false);setNote('');setAtag('');
     if(setFromMik)setFromMik(false);
@@ -421,7 +531,7 @@ function InpTab({db,setDb,patients,setPatients,saveLocal,initData,fromMik,setFro
     <div className="card">
       <div className="ct">データの種類</div>
       <div className="f"><label>種別（複数選択可）</label><div className="chips">{CATS.map(c=><span key={c} className={"chip"+(cats.includes(c)?' on':'')} onClick={()=>tog(cats,setCats,c)}>{c}</span>)}</div></div>
-      <div className="f"><label>技工物内容（複数選択可）</label><div className="chips">{TECHS.map(t=><span key={t} className={"chip"+(techs.includes(t)?' on':'')} onClick={()=>tog(techs,setTechs,t)}>{t}</span>)}</div></div>
+      <div className="f"><label>技工物内容（複数選択可）</label><div className="chips">{TECHS.map(t=><span key={t} className={"chip"+(techs.includes(t)?' on':'')} onClick={()=>togTech(t)}>{t}</span>)}</div></div>
       <div className="chkrow" style={{marginBottom:10}}>
         <label className="ci"><input type="checkbox" checked={old} onChange={e=>setOld(e.target.checked)}/> 旧</label>
         <label className="ci iso"><input type="checkbox" checked={iso} onChange={e=>setIso(e.target.checked)}/> 🚨 急ぎ</label>
@@ -448,7 +558,7 @@ function RecTab({db,updRec,setDb,saveLocal}){
   const togF=k=>setF(f=>({...f,[k]:!f[k]}));
 
   const matchSub=r=>{
-    if(r.chk_mikiroku||isRecordDone(r))return false;
+    if(r.chk_mikiroku||isRecordDone(r)||r.hidden)return false;
     if(sub==='すべて') return true;
     if(sub==='技工物(院外)') return r.cats.includes('技工物')&&r.techs.some(t=>!INHOUSE.includes(t));
     if(sub==='技工物(院内)') return r.cats.includes('技工物')&&r.techs.some(t=>INHOUSE.includes(t))&&!r.techs.some(t=>!INHOUSE.includes(t));
@@ -800,25 +910,29 @@ function DoneTab({db,setDb,saveLocal}){
     if(sub==='追加アライナー')return r.cats.includes('追加アライナー');
     return true;
   };
-  const list=db.filter(r=>!r.chk_mikiroku&&isRecordDone(r)&&matchDone(r)&&(!q||r.patient_name.toLowerCase().includes(q.toLowerCase())||r.patient_id.includes(q)));
-  const del=id=>{ if(!confirm('削除しますか？'))return;const n=db.filter(r=>r.id!==id);setDb(n);saveLocal(n);sbFetch('records?id=eq.'+id,'DELETE'); };
+  const list=db.filter(r=>!r.chk_mikiroku&&!r.hidden&&isRecordDone(r)&&matchDone(r)&&(!q||r.patient_name.toLowerCase().includes(q.toLowerCase())||r.patient_id.includes(q)));
+  const del=id=>{ const r=db.find(x=>x.id===id);if(!confirm((r?r.patient_name+'のデータを':'このデータを')+'記録管理から削除しますか？\n\n確認タブには残ります。'))return;const n=db.map(x=>x.id===id?{...x,hidden:true}:x);setDb(n);saveLocal(n);sbFetch('records?id=eq.'+id,'PATCH',{hidden:true}).catch(()=>{}); };
   return <div>
     <div className="stabs">{DONE_SUBS.map(s=><button key={s} className={"stab"+(sub===s?' on':'')} onClick={()=>setSub(s)}>{s}</button>)}</div>
     <input value={q} onChange={e=>setQ(e.target.value)} placeholder="患者名・IDで検索..." style={{width:'100%',fontSize:13,padding:'8px 10px',border:'1px solid var(--b2)',borderRadius:'var(--rs)',background:'var(--surface)',color:'var(--text)',outline:'none',marginBottom:10}}/>
-
     <div style={{fontSize:12,color:'var(--t2)',marginBottom:12}}>完了 {list.length}件</div>
     {list.length===0?<p className="empty">完了済みの記録はありません</p>:list.map(r=>{
-      const cats=[]; if(r.checks['精密検査'])cats.push('精密検査');if(r.checks['最終検査'])cats.push('最終検査');r.cats.forEach(c=>{if(!cats.includes(c))cats.push(c);});
+      const cats=[];if(r.checks['精密検査'])cats.push('精密検査');if(r.checks['最終検査'])cats.push('最終検査');r.cats.forEach(c=>{if(!cats.includes(c))cats.push(c);});
       return <div key={r.id} className="rc" style={{borderLeft:'4px solid var(--green)'}}>
         <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start'}}>
           <div style={{flex:1}}>
-            <div className="rn">{r.patient_name} {r.old_flag&&<Bdg cls="b-warn">旧</Bdg>} <Bdg cls="b-ok">完了</Bdg></div>
-            <div className="rm">{r.patient_id}　{r.date}　担当: {r.staff||'—'}</div>
+            <div className="rn" style={{display:'flex',alignItems:'center',gap:8,flexWrap:'wrap'}}>
+              <span>{r.patient_name}</span>
+              <StaffBadge staff={r.staff}/>
+              {r.old_flag&&<Bdg cls="b-warn">旧</Bdg>}
+              <Bdg cls="b-ok">完了</Bdg>
+            </div>
+            <div className="rm">{r.patient_id}　{r.date}</div>
             <div style={{marginTop:4,display:'flex',flexWrap:'wrap',gap:4}}>{cats.map(c=>{const col=CAT_COLORS[c]||'#9b948e';return <span key={c} style={{fontSize:10,padding:'1px 6px',borderRadius:8,border:'1px solid '+col+'40',color:col,fontWeight:600}}>{c}</span>;})}</div>
             {r.techs.length>0&&<div className="rm">{r.techs.join('・')}</div>}
             {r.setdate&&<div className="rm">📅 セット: {r.setdate}</div>}
           </div>
-          <div style={{display:'flex',gap:6}}>
+          <div style={{display:'flex',flexDirection:'column',gap:6,marginLeft:8}}>
             <EditBtn r={r} db={db} setDb={setDb} saveLocal={saveLocal}/>
             <button className="btn btn-d" onClick={()=>del(r.id)}>削除</button>
           </div>
@@ -828,7 +942,6 @@ function DoneTab({db,setDb,saveLocal}){
   </div>;
 }
 
-// ---- DCTab ----
 function DCTab({db,updRec,setDb,saveLocal}){
   const [mode,setMode]=useState('all');
   const [q,setQ]=useState('');
@@ -840,6 +953,7 @@ function DCTab({db,updRec,setDb,saveLocal}){
     if(pwInput===ADMIN_PW){setAdminMode(true);setShowPw(false);setPwInput('');}
     else{alert('パスワードが違います');}
   };
+
   const getRC=r=>{ const c=[]; if(r.checks['精密検査'])c.push('精密検査');if(r.checks['最終検査'])c.push('最終検査');r.cats.forEach(x=>{if(!c.includes(x))c.push(x);});if(!c.length)c.push('その他');return c; };
   let list=db.filter(r=>!r.chk_mikiroku);
   if(mode==='unc')list=list.filter(r=>!r.chk_datachecked);
@@ -854,14 +968,20 @@ function DCTab({db,updRec,setDb,saveLocal}){
       <button className="fb" style={mode==='all'?{background:'var(--accent)',color:'#fff',borderColor:'var(--accent)'}:{}} onClick={()=>setMode('all')}>すべて</button>
       <button className="fb" style={mode==='unc'?{background:'var(--accent)',color:'#fff',borderColor:'var(--accent)'}:{}} onClick={()=>setMode('unc')}>未確認のみ</button>
     </div>
-    <input value={q} onChange={e=>setQ(e.target.value)} placeholder="患者名・IDで検索..." style={{width:'100%',fontSize:13,padding:'8px 10px',border:'1px solid var(--b2)',borderRadius:'var(--rs)',background:'var(--surface)',color:'var(--text)',outline:'none',marginBottom:10}}/>
+    <input value={q} onChange={e=>setQ(e.target.value)} placeholder="患者名・IDで検索..." style={{width:'100%',fontSize:13,padding:'8px 10px',border:'1px solid var(--b2)',borderRadius:'var(--rs)',background:'var(--surface)',color:'var(--text)',outline:'none',marginBottom:8}}/>
+    <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:10,flexWrap:'wrap'}}>
+      {!adminMode?<button className="fb" style={{color:'var(--rt)',borderColor:'#fca5a5'}} onClick={()=>setShowPw(v=>!v)}>🔒 管理者モード</button>:<button className="fb" style={{background:'var(--rt)',color:'#fff',borderColor:'var(--rt)'}} onClick={()=>setAdminMode(false)}>🔓 管理者モード中（タップで終了）</button>}
+      {showPw&&!adminMode&&<div style={{display:'flex',gap:6,alignItems:'center'}}><input type="password" value={pwInput} onChange={e=>setPwInput(e.target.value)} onKeyDown={e=>e.key==='Enter'&&tryAdmin()} placeholder="パスワード" style={{fontSize:13,padding:'6px 10px',border:'1px solid var(--b2)',borderRadius:'var(--rs)',background:'var(--surface)',color:'var(--text)',outline:'none',width:140}}/><button className="btn btn-p" style={{padding:'6px 12px',fontSize:12}} onClick={tryAdmin}>確認</button></div>}
+    </div>
     <div style={{overflowX:'auto',borderRadius:'var(--r)',border:'1px solid var(--border)'}}>
       <table style={{width:'100%',borderCollapse:'collapse',fontSize:12,minWidth:580}}>
         <thead><tr style={{background:'var(--s2)',borderBottom:'2px solid var(--border)'}}>
-          <th style={{padding:'8px',textAlign:'left',fontSize:11,color:'var(--t2)',fontWeight:600,whiteSpace:'nowrap'}}>日付</th>
-          <th style={{padding:'8px',textAlign:'left',fontSize:11,color:'var(--t2)',fontWeight:600,whiteSpace:'nowrap'}}>患者名</th>
-          <th style={{padding:'8px',textAlign:'left',fontSize:11,color:'var(--t2)',fontWeight:600,whiteSpace:'nowrap'}}>担当</th>
-          <th style={{padding:'8px',textAlign:'left',fontSize:11,color:'var(--t2)',fontWeight:600,whiteSpace:'nowrap'}}>種別</th>
+          <th style={{padding:'6px 6px',textAlign:'left',fontSize:10,color:'var(--t2)',fontWeight:600,whiteSpace:'nowrap'}}>日付</th>
+          <th style={{padding:'6px 8px',textAlign:'left',fontSize:11,color:'var(--t2)',fontWeight:600,whiteSpace:'nowrap'}}>患者名</th>
+          <th style={{padding:'6px 8px',textAlign:'left',fontSize:11,color:'var(--t2)',fontWeight:600,whiteSpace:'nowrap'}}>担当</th>
+          <th style={{padding:'6px 8px',textAlign:'left',fontSize:11,color:'var(--t2)',fontWeight:600,whiteSpace:'nowrap'}}>種別</th>
+          <th style={{padding:'6px 8px',textAlign:'left',fontSize:11,color:'var(--t2)',fontWeight:600,whiteSpace:'nowrap'}}>技工物</th>
+          <th style={{padding:'6px 8px',textAlign:'left',fontSize:11,color:'var(--t2)',fontWeight:600,whiteSpace:'nowrap'}}>備考</th>
           <th style={{padding:'8px',textAlign:'center',fontSize:11,color:'var(--t2)',fontWeight:600,whiteSpace:'nowrap'}}>検査送信</th>
           <th style={{padding:'8px',textAlign:'center',fontSize:11,color:'var(--t2)',fontWeight:600,whiteSpace:'nowrap'}}>orthocom</th>
           <th style={{padding:'8px',textAlign:'center',fontSize:11,color:'var(--t2)',fontWeight:600,whiteSpace:'nowrap'}}>back up</th>
@@ -870,7 +990,7 @@ function DCTab({db,updRec,setDb,saveLocal}){
         </tr></thead>
         <tbody>
           {order.length===0
-            ?<tr><td colSpan={8} style={{textAlign:'center',padding:'2rem',color:'var(--t3)'}}>データなし</td></tr>
+            ?<tr><td colSpan={10} style={{textAlign:'center',padding:'2rem',color:'var(--t3)'}}>データなし</td></tr>
             :order.flatMap(pid=>{
               const g=grouped[pid];
               const allCats=[...new Set(g.recs.flatMap(r=>getRC(r)))];
@@ -881,8 +1001,8 @@ function DCTab({db,updRec,setDb,saveLocal}){
                 const needsK=rc.includes('精密検査')||rc.includes('最終検査');
                 const rowBg=r.chk_datachecked?'#f0fdf4':ri%2===0?'var(--surface)':'#fafaf9';
                 return <tr key={r.id} style={{background:rowBg,borderBottom:'1px solid var(--border)',borderLeft:ri===0?'3px solid '+borderCol:'3px solid transparent'}}>
-                  <td style={{padding:'8px',color:'var(--t2)',whiteSpace:'nowrap'}}>{r.date}</td>
-                  <td style={{padding:'8px',fontWeight:700}}>
+                  <td style={{padding:'6px',color:'var(--t3)',fontSize:10,whiteSpace:'nowrap'}}>{r.date}</td>
+                  <td style={{padding:'6px 8px',fontWeight:700,whiteSpace:'nowrap'}}>
                     {ri===0?<div><div>{g.name}</div><div style={{fontSize:10,color:'var(--t3)'}}>{g.pid}</div></div>:''}
                   </td>
                   <td style={{padding:'8px',whiteSpace:'nowrap'}}><StaffBadge staff={r.staff}/></td>
@@ -891,18 +1011,17 @@ function DCTab({db,updRec,setDb,saveLocal}){
                       {rc.map(c=>{const col=CCOL[c]||'#9b948e';return <span key={c} style={{fontSize:10,padding:'1px 5px',borderRadius:8,background:col+'18',border:'1px solid '+col+'40',color:col,fontWeight:600,whiteSpace:'nowrap'}}>{c}</span>;})}
                     </div>
                   </td>
+                  <td style={{padding:'6px 8px',fontSize:11,color:'var(--t2)'}}>{(r.techs||[]).join('・')||'—'}</td>
+                  <td style={{padding:'6px 8px',fontSize:11,color:'var(--amt)'}}>{r.note&&r.note!=='未記入'?r.note:'—'}</td>
                   {KENSA_CHK.map(k=><td key={k} style={{padding:'8px',textAlign:'center'}}>
                     {needsK?<input type="checkbox" checked={!!r.checks[k]} onChange={e=>updChk(r.id,k,e.target.checked)} style={{width:16,height:16,accentColor:'var(--green)',cursor:'pointer'}}/>:<span style={{color:'var(--t3)',fontSize:11}}>—</span>}
                   </td>)}
                   <td style={{padding:'8px',textAlign:'center'}}>
-                    {adminMode
-                      ? <input type="checkbox" checked={!!r.chk_datachecked} onChange={e=>updDC(r.id,e.target.checked)} style={{width:16,height:16,accentColor:'var(--accent)',cursor:'pointer'}}/>
-                      : <span style={{fontSize:14}}>{r.chk_datachecked?'✅':'⬜'}</span>
-                    }
+                    <input type="checkbox" checked={!!r.chk_datachecked} onChange={e=>updDC(r.id,e.target.checked)} style={{width:16,height:16,accentColor:'var(--accent)',cursor:'pointer'}}/>
                   </td>
-                  <td style={{padding:'6px 8px',textAlign:'center'}}>
-                    <button className="btn btn-d" onClick={()=>{if(!confirm('削除しますか？'))return;const n=db.filter(x=>x.id!==r.id);setDb(n);saveLocal(n);sbFetch('records?id=eq.'+r.id,'DELETE').catch(()=>{});}}>削除</button>
-                  </td>
+                  {adminMode&&<td style={{padding:'6px 8px',textAlign:'center'}}>
+                    <button className="btn btn-d" onClick={()=>{if(!confirm(r.patient_name+'のデータを削除しますか？\n\nこの操作は取り消せません。'))return;const n=db.filter(x=>x.id!==r.id);setDb(n);saveLocal(n);sbFetch('records?id=eq.'+r.id,'DELETE').catch(()=>{});}}>削除</button>
+                  </td>}
                 </tr>;
               });
             })
@@ -920,11 +1039,11 @@ const IWEEK_SECTIONS = [
   { key:'技工物',        label:'技工物',        color:'#ea580c', match: r=>r.cats.includes('技工物') },
   { key:'再iTero',       label:'再iTero',       color:'#d97706', match: r=>r.cats.includes('再iTero') },
   { key:'追加アライナー',label:'追加アライナー', color:'#7c3aed', match: r=>r.cats.includes('追加アライナー') },
-  { key:'その他',        label:'その他',        color:'#9b948e', match: r=>!r.checks['精密検査']&&!r.checks['最終検査']&&!r.cats.includes('技工物')&&!r.cats.includes('再iTero')&&!r.cats.includes('追加アライナー') },
+  { key:'その他',        label:'その他',        color:'#9b948e', match: r=>r.cats.includes('その他')&&!r.checks['精密検査']&&!r.checks['最終検査']&&!r.cats.includes('技工物')&&!r.cats.includes('再iTero')&&!r.cats.includes('追加アライナー') },
 ];
 const CC_MAP = {'精密検査':'#3b82f6','最終検査':'#0d9488','技工物':'#ea580c','追加アライナー':'#7c3aed','再iTero':'#d97706'};
 
-function IteroWeekGrid({list, updReady, dayLabel}){
+function IteroWeekGrid({list, updReady, dayLabel, db, setDb, saveLocal}){
   return <div>
     {IWEEK_SECTIONS.map(sec=>{
       const items = list.filter(sec.match);
@@ -945,6 +1064,7 @@ function IteroWeekGrid({list, updReady, dayLabel}){
                   <div style={{marginTop:2}}><StaffBadge staff={r.staff}/></div>
                   {r.techs&&r.techs.length>0&&<div style={{fontSize:10,color:'var(--t2)',marginTop:2}}>{r.techs.join('・')}</div>}
                   <div style={{fontSize:10,color:'var(--accent)',fontWeight:600,marginTop:3}}>📅 {dayLabel(r.date)}</div>
+                  <div style={{marginTop:4}}><EditBtn r={r} db={db} setDb={setDb} saveLocal={saveLocal}/></div>
                 </div>
                 <label style={{display:'flex',flexDirection:'column',alignItems:'center',gap:2,cursor:'pointer',flexShrink:0}}>
                   <input type="checkbox" checked={!!checked} onChange={e=>updReady(r.id,e.target.checked)} style={{width:17,height:17,accentColor:'var(--green)',cursor:'pointer'}}/>
@@ -960,37 +1080,47 @@ function IteroWeekGrid({list, updReady, dayLabel}){
 }
 
 // ---- IteroWeekTab ----
-function IteroWeekTab({db, updRec}){
+function IteroWeekTab({db, updRec, setDb, saveLocal}){
   const [selDate, setSelDate] = useState(today());
   const [filter, setFilter] = useState('today');
+  const [pick1, setPick1] = useState('');
+  const [pick2, setPick2] = useState('');
   const getTargetDates = () => {
-    const base = new Date(selDate);
-    const fmt = d => d.toISOString().slice(0,10);
-    const d1 = new Date(base); d1.setDate(base.getDate()-1);
-    const d2 = new Date(base); d2.setDate(base.getDate()-2);
-    if(filter==='today')     return [selDate];
-    if(filter==='yesterday') return [fmt(d1)];
-    if(filter==='before')    return [fmt(d2)];
-    return [selDate, fmt(d1), fmt(d2)];
+    if(filter==='today')  return [selDate];
+    if(filter==='pick1')  return pick1?[pick1]:[];
+    if(filter==='pick2')  return pick2?[pick2]:[];
+    // all: 今日＋選択した日付
+    const dates=[selDate];
+    if(pick1) dates.push(pick1);
+    if(pick2) dates.push(pick2);
+    return [...new Set(dates)];
   };
   const targets = getTargetDates();
   const list = db.filter(r=>!r.chk_mikiroku&&r.date&&targets.includes(r.date))
     .sort((a,b)=>{ if(a.date!==b.date)return b.date.localeCompare(a.date); return a.patient_name.localeCompare(b.patient_name); });
   const updReady = (id, val) => { updRec(id,{chk_ready:val}); sbFetch('records?id=eq.'+id,'PATCH',{chk_ready:val}); };
-  const FILTER_BTNS = [{k:'today',label:'今日'},{k:'yesterday',label:'前日'},{k:'before',label:'前々日'},{k:'all',label:'3日分'}];
-  const dayLabel = d => { const diff=Math.round((new Date(selDate)-new Date(d))/(1000*60*60*24)); if(diff===0)return '今日';if(diff===1)return '前日';if(diff===2)return '前々日';return d; };
+  const FILTER_BTNS = [{k:'today',label:'今日'},{k:'pick1',label:'日付1'},{k:'pick2',label:'日付2'},{k:'all',label:'3日分'}];
+  const dayLabel = d => { const diff=Math.round((new Date(selDate)-new Date(d))/(1000*60*60*24)); if(diff===0)return '今日';return d; };
   const CCOL2 = {'再iTero':'#d97706','追加アライナー':'#7c3aed'};
   return <div>
-    <div style={{display:'flex',gap:8,alignItems:'center',marginBottom:12,flexWrap:'wrap'}}>
-      <input type="date" value={selDate} onChange={e=>setSelDate(e.target.value)} style={{fontSize:13,padding:'7px 10px',border:'1px solid var(--b2)',borderRadius:'var(--rs)',background:'var(--surface)',color:'var(--text)',outline:'none'}}/>
-      <div className="fbtns" style={{margin:0}}>
-        {FILTER_BTNS.map(b=><button key={b.k} className={"fb"+(filter===b.k?' on':'')} style={filter===b.k?{background:'var(--accent)',color:'#fff',borderColor:'var(--accent)'}:{}} onClick={()=>setFilter(b.k)}>{b.label}</button>)}
+    <div style={{marginBottom:12}}>
+      <div style={{display:'flex',gap:8,alignItems:'center',marginBottom:8,flexWrap:'wrap'}}>
+        <span style={{fontSize:12,color:'var(--t2)'}}>今日:</span>
+        <input type="date" value={selDate} onChange={e=>setSelDate(e.target.value)} style={{fontSize:13,padding:'6px 10px',border:'1px solid var(--b2)',borderRadius:'var(--rs)',background:'var(--surface)',color:'var(--text)',outline:'none'}}/>
+        <button className={"fb"+(filter==='today'?' on':'')} style={filter==='today'?{background:'var(--accent)',color:'#fff',borderColor:'var(--accent)'}:{}} onClick={()=>setFilter('today')}>今日のみ</button>
+        <button className={"fb"+(filter==='all'?' on':'')} style={filter==='all'?{background:'var(--accent)',color:'#fff',borderColor:'var(--accent)'}:{}} onClick={()=>setFilter('all')}>まとめて表示</button>
+      </div>
+      <div style={{display:'flex',gap:8,alignItems:'center',marginBottom:4,flexWrap:'wrap'}}>
+        <span style={{fontSize:12,color:'var(--t2)'}}>日付1:</span>
+        <input type="date" value={pick1} onChange={e=>{setPick1(e.target.value);setFilter('pick1');}} style={{fontSize:13,padding:'6px 10px',border:'1px solid var(--b2)',borderRadius:'var(--rs)',background:filter==='pick1'?'var(--abg)':'var(--surface)',color:'var(--text)',outline:'none'}}/>
+        <span style={{fontSize:12,color:'var(--t2)'}}>日付2:</span>
+        <input type="date" value={pick2} onChange={e=>{setPick2(e.target.value);setFilter('pick2');}} style={{fontSize:13,padding:'6px 10px',border:'1px solid var(--b2)',borderRadius:'var(--rs)',background:filter==='pick2'?'var(--abg)':'var(--surface)',color:'var(--text)',outline:'none'}}/>
       </div>
     </div>
     <div style={{fontSize:12,color:'var(--t2)',marginBottom:8}}>{list.length}件</div>
     {list.length===0
       ? <p className="empty">該当するデータはありません</p>
-      : <IteroWeekGrid list={list} updReady={updReady} dayLabel={dayLabel}/>
+      : <IteroWeekGrid list={list} updReady={updReady} dayLabel={dayLabel} db={db} setDb={setDb} saveLocal={saveLocal}/>
     }
   </div>;
 }
@@ -1051,9 +1181,79 @@ function TodayTab({db, updRec}){
   </div>;
 }
 
+
+// ---- ReportModal ----
+function ReportModal({onClose}){
+  const [text,setText]=useState('');
+  const [reporter,setReporter]=useState('');
+  const [msg,setMsg]=useState(null);
+
+  const send=async()=>{
+    if(!text.trim()){setMsg({err:'内容を入力してください'});return;}
+    setMsg({info:'送信中...'});
+    try{
+      await sbFetch('bug_reports','POST',{
+        reporter:reporter||'匿名',
+        content:text,
+        created_at:new Date().toISOString(),
+        resolved:false
+      });
+      setMsg({ok:'報告を送信しました！ありがとうございます。'});
+      setTimeout(()=>onClose(),2000);
+    }catch(e){
+      // Supabase テーブルがない場合はローカル保存
+      const reports=JSON.parse(localStorage.getItem('bug_reports')||'[]');
+      reports.push({reporter:reporter||'匿名',content:text,created_at:new Date().toISOString()});
+      localStorage.setItem('bug_reports',JSON.stringify(reports));
+      setMsg({ok:'報告を保存しました！'});
+      setTimeout(()=>onClose(),2000);
+    }
+  };
+
+  return <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.5)',zIndex:1000,display:'flex',alignItems:'flex-end',justifyContent:'center'}} onClick={e=>{if(e.target===e.currentTarget)onClose();}}>
+    <div style={{background:'var(--surface)',width:'100%',maxWidth:600,borderRadius:'16px 16px 0 0',padding:20,paddingBottom:'calc(20px + env(safe-area-inset-bottom,0px))'}}>
+      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:16}}>
+        <div style={{fontSize:15,fontWeight:700}}>🐛 不具合・要望の報告</div>
+        <button onClick={onClose} style={{fontSize:18,background:'none',border:'none',cursor:'pointer',color:'var(--t2)'}}>✕</button>
+      </div>
+      <div className="f" style={{marginBottom:10}}>
+        <label>名前</label>
+        <select value={reporter} onChange={e=>setReporter(e.target.value)} style={{fontSize:14,borderRadius:'var(--rs)',border:'1px solid var(--b2)',padding:'9px 10px',background:'var(--s2)',color:'var(--text)',outline:'none',WebkitAppearance:'none'}}>
+          <option value="">選択</option>{STAFF.map(s=><option key={s}>{s}</option>)}
+        </select>
+      </div>
+      <div className="f" style={{marginBottom:10}}>
+        <label>内容</label>
+        <textarea value={text} onChange={e=>setText(e.target.value)} placeholder="例: ○○タブで△△が表示されない" rows={4} style={{fontSize:14,borderRadius:'var(--rs)',border:'1px solid var(--b2)',padding:'9px 10px',background:'var(--s2)',color:'var(--text)',outline:'none',resize:'vertical',width:'100%'}}/>
+      </div>
+      {msg&&<div className={"al "+(msg.ok?'al-ok':msg.err?'al-err':'')} style={msg.info?{background:'var(--s2)',color:'var(--t2)'}:{}}>{msg.ok||msg.err||msg.info}</div>}
+      <button className="btn btn-p" style={{width:'100%'}} onClick={send}>送信する</button>
+    </div>
+  </div>;
+}
+
 // ---- DashTab ----
 function DashTab({db}){
   const m=ym();
+  const [reports,setReports]=useState([]);
+  const [loadingR,setLoadingR]=useState(false);
+
+  const loadReports=async()=>{
+    setLoadingR(true);
+    try{
+      const r=await sbFetch('bug_reports?order=created_at.desc&limit=20');
+      if(r) setReports(r);
+    }catch(e){}
+    setLoadingR(false);
+  };
+
+  useEffect(()=>{loadReports();},[]);
+
+  const resolveReport=async(id)=>{
+    await sbFetch('bug_reports?id=eq.'+id,'PATCH',{resolved:true});
+    setReports(r=>r.map(x=>x.id===id?{...x,resolved:true}:x));
+  };
+
   const recent=db.filter(r=>!r.chk_mikiroku&&!isRecordDone(r)).slice(0,10);
   return <div>
     <div className="metrics">
@@ -1069,6 +1269,21 @@ function DashTab({db}){
       <div className="rm">{r.patient_id}　{r.date}　{r.staff||'—'}</div>
       <div className="rm">{r.cats.join('・')}　{r.techs.join('・')}</div>
     </div>)}
+    <div style={{fontSize:13,fontWeight:600,marginBottom:8,marginTop:16}}>🐛 不具合報告</div>
+    <button className="btn" style={{fontSize:12,padding:'5px 12px',marginBottom:10}} onClick={loadReports}>{loadingR?'読み込み中...':'更新'}</button>
+    {reports.length===0
+      ?<p className="empty">報告なし</p>
+      :reports.map(r=><div key={r.id} className="rc" style={{borderLeft:'4px solid '+(r.resolved?'var(--green)':'var(--red)'),opacity:r.resolved?0.6:1}}>
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start'}}>
+          <div style={{flex:1}}>
+            <div style={{fontSize:12,fontWeight:600,color:r.resolved?'var(--gt)':'var(--rt)'}}>{r.resolved?'✅ 解決済み':'🔴 未解決'}</div>
+            <div style={{fontSize:13,marginTop:4}}>{r.content}</div>
+            <div style={{fontSize:11,color:'var(--t2)',marginTop:3}}>{r.reporter||'匿名'}　{r.created_at?r.created_at.slice(0,16).replace('T',' '):''}</div>
+          </div>
+          {!r.resolved&&<button className="btn" style={{fontSize:11,padding:'4px 10px',background:'var(--gbg)',color:'var(--gt)',borderColor:'#bbf7d0',marginLeft:8,whiteSpace:'nowrap'}} onClick={()=>resolveReport(r.id)}>解決済みにする</button>}
+        </div>
+      </div>)
+    }
   </div>;
 }
 
